@@ -9,6 +9,13 @@ auto& gpMoonMask = StaticRef<RwTexture*>(0xC6AA74);
 auto& gpCloudTex = StaticRef<RwTexture*>(0xC6AA78);
 auto& gpCloudMaskTex = StaticRef<RwTexture*>(0xC6AA7C);
 
+auto& windShift = StaticRef<float>(0xC6E954);
+
+// Static tables used by RenderBottomFromHeight
+auto& ms_bottomCloudRandTable    = StaticRef<float[80]>(0x8D5658); // random values [0..1]
+auto& ms_bottomCloudCoorsOffsetY = StaticRef<float[30]>(0x8D57A0);
+auto& ms_bottomCloudCoorsOffsetX = StaticRef<float[30]>(0x8D5818);
+
 void CClouds::InjectHooks() {
     RH_ScopedClass(CClouds);
     RH_ScopedCategoryGlobal();
@@ -20,7 +27,7 @@ void CClouds::InjectHooks() {
     RH_ScopedInstall(SetUpOneSkyPoly, 0x713060);
     RH_ScopedInstall(Render, 0x713950);
     RH_ScopedInstall(RenderSkyPolys, 0x714650);
-    RH_ScopedInstall(RenderBottomFromHeight, 0x7154B0, { .reversed = false });
+    RH_ScopedInstall(RenderBottomFromHeight, 0x7154B0);
 
     // Moving fog
     RH_ScopedInstall(MovingFogInit, 0x713660);
@@ -859,41 +866,181 @@ void CClouds::RenderSkyPolys() {
 
 // 0x7154B0
 void CClouds::RenderBottomFromHeight() {
-    /****
-    * Code below should be good
-    * but it isn't complete...
-    *****\
-   
-    const auto camPos = TheCamera.GetPosition();
-    if (camPos.z < -90.f) { // 0x71557D [Moved up here]
-        return;
-    }
+    const auto& cc = CTimeCycle::m_CurrentColours; // cc = colour components
 
-    const auto& cc = CTimeCycle::m_CurrentColours; // cc = color component
+    // Brightened colours: only used by vertex 0 of each blanket quad (gradient)
     const auto ClampClr = [](float clr) {
         return std::min(clr, 255.f);
     };
-    const auto fcClr = CRGBA{ // fc = fluffy clouds
-        (uint8)ClampClr(cc.m_nFluffyCloudsBottomRed * 2.f + 20.f),
-        (uint8)ClampClr(cc.m_nFluffyCloudsBottomGreen * 1.5f),
-        (uint8)ClampClr(cc.m_nFluffyCloudsBottomBlue * 1.5f),
-        (uint8)255
-    };
+    const auto brightR = (int32)ClampClr((float)cc.m_nFluffyCloudsBottomRed * 2.f + 20.f);
+    const auto brightG = (int32)ClampClr((float)cc.m_nFluffyCloudsBottomGreen * 1.5f);
+    const auto brightB = (int32)ClampClr((float)cc.m_nFluffyCloudsBottomBlue * 1.5f);
 
-    auto lowZ = 160.f, highZ = 190.f;
+    if (TheCamera.GetPosition().z < -90.f) { // 0x71557D [Moved up here; no side effects before this]
+        return;
+    }
 
-    auto& windShift = StaticRef<float>(0xC6E954);
+    float lowZ = 160.f, highZ = 190.f; // 0x71557D
+    if (const float f = (TheCamera.GetPosition().z - 190.f - 10.f) * 0.3f; f > 0.f) { // 0x715597
+        lowZ  = 160.f + f;
+        highZ = 190.f + f;
+    }
+    const float height = highZ - lowZ;
 
-    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE,      RWRSTATE(TRUE));
+    windShift += CTimer::ms_fTimeStep * CWeather::Wind * 0.25f; // 0x7155D3
+
+    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE,      RWRSTATE(FALSE));
     RwRenderStateSet(rwRENDERSTATEZTESTENABLE,       RWRSTATE(TRUE));
     RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, RWRSTATE(TRUE));
-    RwRenderStateSet(rwRENDERSTATEFOGENABLE,         RWRSTATE(TRUE));
+    RwRenderStateSet(rwRENDERSTATEFOGENABLE,         RWRSTATE(FALSE));
     RwRenderStateSet(rwRENDERSTATESRCBLEND,          RWRSTATE(rwBLENDSRCALPHA));
     RwRenderStateSet(rwRENDERSTATEDESTBLEND,         RWRSTATE(rwBLENDINVSRCALPHA));
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER,     RWRSTATE(RwTextureGetRaster(gpCloudMaskTex)));
 
-    // TODO....
-    */
+    const auto coverage = (int32)cc.m_fCloudAlpha; // 0x715654
+
+    // Phase 1: cloud cover blanket (Im3D quads using the cloud mask texture) - 0x715670
+    if (coverage != 0) {
+        uiTempBufferIndicesStored = 0;
+        uiTempBufferVerticesStored = 0;
+
+        for (int32 i = 1; i <= 28; i++) { // 0x715693
+            const float shift = (ms_bottomCloudRandTable[(i + 5) % 80] * 0.5f + 1.f) * windShift;
+
+            const auto camPos = TheCamera.GetPosition();
+
+            // 512x512 cells wrapped around the camera
+            const float x0 = ms_bottomCloudRandTable[(i - 1) % 80] * 512.f + shift - camPos.x;
+            const float y0 = ms_bottomCloudRandTable[i % 80] * 512.f + shift - camPos.y;
+            const float wx = (x0 - (float)(((int32)x0 & ~0x1FF) + 0x100)) + camPos.x;
+            const float wy = (y0 - (float)(((int32)y0 & ~0x1FF) + 0x100)) + camPos.y;
+            const float wz = ms_bottomCloudRandTable[(i + 1) % 80] * height + lowZ;
+
+            // fade only when the blanket is above the camera - 0x7157CE
+            int32 alpha = coverage;
+            if (wz - camPos.z > 0.f) {
+                alpha = (int32)((1.f - (wz - camPos.z) * 0.004f) * (float)coverage);
+            }
+            if (alpha <= 0) {
+                continue;
+            }
+
+            // fade by Chebyshev distance (far cells) - 0x71580D
+            const float dist = std::max(std::fabs(camPos.x - wx), std::fabs(camPos.y - wy)) / 256.f;
+            if (dist > 0.75f) {
+                alpha = (int32)((1.f - (dist - 0.75f) * 4.f) * (float)alpha);
+            }
+            if (alpha <= 0) {
+                continue;
+            }
+
+            const float sizeX = ms_bottomCloudRandTable[(i + 2) % 80] * 100.f + 60.f; // 0x71596F
+            const float sizeY = ms_bottomCloudRandTable[(i + 3) % 80] * 100.f + 60.f;
+
+            const auto v = uiTempBufferVerticesStored;
+            auto* const ix = &aTempBufferIndices[uiTempBufferIndicesStored];
+            ix[0] = v + 2;
+            ix[1] = v + 1;
+            ix[2] = v;
+            ix[3] = v + 2;
+            ix[4] = v + 3;
+            ix[5] = v + 1;
+
+            auto* const verts = &TempBufferVertices.m_3d[v];
+
+            RwIm3DVertexSetRGBA(&verts[0], (uint8)brightR, (uint8)brightG, (uint8)brightB, (uint8)alpha);
+            RwIm3DVertexSetPos(&verts[0], wx - sizeX, wy + sizeY, wz);
+            RwIm3DVertexSetU(&verts[0], 0.f);
+            RwIm3DVertexSetV(&verts[0], 0.f);
+
+            RwIm3DVertexSetRGBA(&verts[1], (uint8)cc.m_nFluffyCloudsBottomRed, (uint8)cc.m_nFluffyCloudsBottomGreen, (uint8)cc.m_nFluffyCloudsBottomBlue, (uint8)alpha);
+            RwIm3DVertexSetPos(&verts[1], wx + sizeX, wy + sizeY, wz);
+            RwIm3DVertexSetU(&verts[1], 0.f);
+            RwIm3DVertexSetV(&verts[1], 1.f);
+
+            RwIm3DVertexSetRGBA(&verts[2], (uint8)cc.m_nFluffyCloudsBottomRed, (uint8)cc.m_nFluffyCloudsBottomGreen, (uint8)cc.m_nFluffyCloudsBottomBlue, (uint8)alpha);
+            RwIm3DVertexSetPos(&verts[2], wx - sizeX, wy - sizeY, wz);
+            RwIm3DVertexSetU(&verts[2], 1.f);
+            RwIm3DVertexSetV(&verts[2], 0.f);
+
+            RwIm3DVertexSetRGBA(&verts[3], (uint8)cc.m_nFluffyCloudsBottomRed, (uint8)cc.m_nFluffyCloudsBottomGreen, (uint8)cc.m_nFluffyCloudsBottomBlue, (uint8)alpha);
+            RwIm3DVertexSetPos(&verts[3], wx + sizeX, wy - sizeY, wz);
+            RwIm3DVertexSetU(&verts[3], 1.f);
+            RwIm3DVertexSetV(&verts[3], 1.f);
+
+            uiTempBufferIndicesStored += 6;
+            uiTempBufferVerticesStored += 4;
+        }
+
+        if (uiTempBufferIndicesStored) { // 0x715B0D
+            if (RwIm3DTransform(TempBufferVertices.m_3d, uiTempBufferVerticesStored, nullptr, rwIM3D_VERTEXUV | rwIM3D_VERTEXXYZ | rwIM3D_VERTEXRGBA)) {
+                RwIm3DRenderIndexedPrimitive(rwPRIMTYPETRILIST, aTempBufferIndices, uiTempBufferIndicesStored);
+                RwIm3DEnd();
+            }
+        }
+        uiTempBufferIndicesStored = 0;
+        uiTempBufferVerticesStored = 0;
+    }
+
+    CSprite::InitSpriteBuffer(); // 0x715B57
+
+    // Phase 2: ring of 30 fluffy cloud sprites - 0x715B80
+    if (coverage > 0) {
+        for (int32 i = 0; i < 30; i++) {
+            const auto camPos = TheCamera.GetPosition();
+
+            // 256x256 cells wrapped around the camera
+            const float x0 = windShift * 0.5f + ms_bottomCloudCoorsOffsetX[i] - camPos.x;
+            const float y0 = windShift * 0.5f + ms_bottomCloudCoorsOffsetY[i] - camPos.y;
+            const float wx = (x0 - (float)(((int32)x0 & ~0xFF) + 0x80)) + camPos.x;
+            const float wy = (y0 - (float)(((int32)y0 & ~0xFF) + 0x80)) + camPos.y;
+            const float wz = ms_bottomCloudRandTable[i % 80] * height + lowZ;
+
+            const int32 zFadedAlpha = (int32)((1.f - std::fabs(camPos.z - wz) * 0.004f) * (float)coverage); // 0x715C4B
+            if (zFadedAlpha <= 0) {
+                continue;
+            }
+            int32 alpha = zFadedAlpha;
+
+            const float size = (ms_bottomCloudRandTable[(i + 1) % 80] + 1.f) * 12.f; // 0x715CB9
+
+            float dist = std::max(std::fabs(camPos.x - wx), std::fabs(camPos.y - wy)) / 128.f; // 0x715CD7
+            if (dist > 1.f) {
+                dist = 1.f;
+            }
+            if (dist > 0.75f) {
+                alpha = (int32)((1.f - (dist - 0.75f) * 4.f) * (float)alpha);
+            }
+
+            if (dist > 0.05f) { // 0x715E3A
+                if (dist < 0.1f) { // fade-in at the inner edge
+                    alpha = (int32)((dist - 0.05f) * (float)alpha * 20.f);
+                }
+
+                CVector scr;
+                float w, h;
+                if (CSprite::CalcScreenCoors({ wx, wy, wz }, &scr, &w, &h, false, true)) { // 0x715E8B
+                    CSprite::RenderBufferedOneXLUSprite(
+                        scr,
+                        { w * size, h * size },
+                        (uint8)cc.m_nFluffyCloudsBottomRed,
+                        (uint8)cc.m_nFluffyCloudsBottomGreen,
+                        (uint8)cc.m_nFluffyCloudsBottomBlue,
+                        256,
+                        1.f / scr.z,
+                        (uint8)alpha
+                    );
+                }
+            }
+        }
+    }
+
+    CSprite::FlushSpriteBuffer(); // 0x715EFB
+
+    RwRenderStateSet(rwRENDERSTATETEXTURERASTER,     RWRSTATE(NULL));
+    RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, RWRSTATE(FALSE));
+    RwRenderStateSet(rwRENDERSTATEZWRITEENABLE,      RWRSTATE(TRUE));
+    RwRenderStateSet(rwRENDERSTATEZTESTENABLE,       RWRSTATE(TRUE));
 }
 
 //
