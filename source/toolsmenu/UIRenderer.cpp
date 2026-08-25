@@ -109,7 +109,7 @@ void UIRenderer::PreRenderUpdate() {
     DebugCode();
     ReversibleHooks::CheckAll();
 
-    if (ImGui::IsKeyChordPressed(ImGuiKey_F7, ImGuiInputFlags_RouteAlways) || CPad::GetPad()->IsFKeyJustDown(FKEY7)) {
+    if (ImGui::IsKeyChordPressed(ImGuiKey_F7, ImGuiInputFlags_RouteAlways) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_M, ImGuiInputFlags_RouteAlways) || CPad::GetPad()->IsFKeyJustDown(FKEY7)) {
         SetIsActive(!m_InputActive);
     }
 }
